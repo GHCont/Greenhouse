@@ -1,0 +1,162 @@
+clear all
+close all
+dat=readtable('Data_after_alterations.txt');    %reads data from csv file
+
+%converts timestamps from the data to iterating timesteps
+timecomp=datevec(dat{:, 1}, 'HH:MM:SS');
+timesec=timecomp(:, 4)*3600 + timecomp(:, 5)*60 + timecomp(:, 6);
+timesec=timesec-min(timesec);
+data.timesec=timesec;
+
+yy=table2array(dat(:, 2));   %temp
+zz=table2array(dat(:, 3));   %rh
+uu=table2array(dat(:, 10));   %input_heater
+
+%produces a figure to allow quick viewing of some of the data
+figure(1)
+subplot(111)
+title('Temperature and input against time')
+hold on
+plot(yy);
+ylabel('text')
+ylabel(['Temperature ' char(176) 'C'])
+grid on
+xlabel('Timestep')
+axis([1 70 14 21])
+yyaxis right
+axis([0 70 0 2])
+plot(uu, 'linewidth', 1);
+ylabel('Input Signal (Binary)')
+xlabel('Time')
+
+legend('Temp', 'Input Signal')
+hold off
+
+figure(2)
+subplot(111)
+title('RH and input against time')
+hold on
+plot(zz);
+ylabel('text')
+ylabel(['RH in %'])
+grid on
+xlabel('Time')
+axis([1 70 70 110])
+
+yyaxis right
+axis([1 70 0 2])
+plot(uu, 'linewidth', 1);
+ylabel('Input Signal (Binary)')
+xlabel('Time')
+
+legend('RH', 'Heater Input Signal')
+hold off
+
+%here data was recorded every 30s, to imitate the standard control cycle of
+%2 minutes, the data is subsampled by a factor of 4
+yyd=downsample(yy, 4);
+uud=downsample(uu, 4);
+zzd=downsample(zz, 4);
+
+%plot of the subsampled data
+figure(3)
+subplot(111)
+title('Temperature against time with input signal (subsampled')
+hold on
+plot(yyd);
+ylabel('text')
+ylabel(['Temperature ' char(176) 'C'])
+grid on
+xlabel('Time')
+axis([1 18 14 21])
+
+yyaxis right
+axis([1 18 0 2])
+plot(uud, 'linewidth', 1);
+ylabel('Input Signal (Binary)')
+xlabel('Timestep')
+legend('Temp', 'Heater Input Signal')
+hold off
+
+yyr=yyd-15; %baseline subtracted (prepz could be used here)
+yyt=[yyr uud]; %temperature and signal input formed into an array
+zzr=zzd-100;  %same process as above but fro humidity
+zzt=[zzr uud];
+
+[th, stats, e2]=riv(yyt, [1 1 1 0]);  %note only riv used here as the model 
+%parameters are known
+rt2=stats(3)    %retrieves rt2 statistics from 'stats' function of riv
+[at, bt]=getpar(th) %retireves the parameters of the TF from riv
+
+%plot of the TF against the true temperature change
+figure(4)
+subplot(111)
+title('TF model vs true data for Temperature')
+hold on
+plot(yyr-e2, 'linewidth', 1);
+plot(yyr, 'linewidth', 1);
+ylabel('text')
+ylabel(['Temperature ' char(176) 'C'])
+grid on
+xlabel('Sample')
+axis([1 18 0 6])
+%legend('Estimated Output', 'Measured Output ', 'Input signal')
+
+yyaxis right
+axis([1 18 0 2])
+plot(uud, 'linewidth', 1);
+legend('Estimated Output', 'Measured Output ', 'Input signal')
+ylabel('Input Signal (Binary)')
+xlabel('Timestep')
+hold off
+
+%repeated for humidity
+[th, stats, e]=riv(zzt, [1 1 2 0]);
+rt21=stats(3)
+[at1, bt1]=getpar(th)
+
+figure(5)
+subplot(111)
+hold on
+plot(zzr-e, 'linewidth', 1);
+plot(zzr, 'linewidth', 1);
+ylabel('text')
+ylabel(['RH %'])
+grid on
+xlabel('Sample')
+axis([1 18 -20 0])
+
+yyaxis right
+axis([1 18 0 2])
+plot(uud, 'linewidth', 1);
+title('TF model vs true data for RH')
+legend('Estimated Output', 'Measured Output ', 'Input signal')
+ylabel('Input Signal (Binary)')
+xlabel('Timestep')
+hold off
+
+p=[0.6] %poles of the PIP controller
+d=poly(p)   %as there is only one pole, all poles are set to 0.6
+v=pip(at(2:end), bt(2:end), p)
+[fpip, gpip, kpip]=pipgains(at(2:end), bt(2:end), v);   %outputs the
+%coefficients for the PIP controller
+fpip
+gpip
+kpip
+
+%simulates the PIP controller in SIMULINK and plots the results in MATLAB
+sim('control.slx')
+figure(6)
+subplot(111)
+title('Temperature and input against time')
+hold on
+plot(yysim(:, 2), 'linewidth', 1);
+plot(yysim(:, 3), 'linewidth', 1);
+plot(yysim(:, 4), 'linewidth', 1);
+ylabel('text')
+ylabel(['Temperature ' char(176) 'C'])
+grid on
+xlabel('Sample')
+%axis([1 40 -0.1 1])
+legend('Input', 'Control Input', 'Output')
+hold off
