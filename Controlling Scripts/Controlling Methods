@@ -1,0 +1,486 @@
+import RPi.GPIO as GPIO
+import time
+from datetime import datetime
+from datetime import date, timedelta
+import csv
+import time
+from math import exp
+import smbus2
+import fcntl
+
+def reset_i2c_bus():
+    try:
+        bus = smbus2.SMBus(1)
+        fcntl.ioctl(bus.fileno(), 0x0703, 0)
+    except Exception as e:
+        print(f"Error: {e}")
+    except:
+        print('unknown error')
+    try:
+        bus.close()
+    except:
+        pass
+
+def scan_i2c_bus():
+    active_addresses = []
+    try:
+        bus = smbus2.SMBus(1)   #bus 1 is standard for i2c on rpi
+        for address in range(0, 128):
+            try:
+                bus.read_byte(address)
+                active_addresses.append(address)
+            except OSError:
+                pass
+    except:
+        pass
+    try:
+        bus.close()
+    except:
+        pass
+    return active_addresses
+
+#returns active addresses found on I2C bus
+#useful for debugging
+def i2c_return():
+    active_addresses = scan_i2c_bus()
+    if active_addresses:
+        print("Active addresses:")
+        for address in active_addresses:
+            print(f"0x{address:02X}")
+    else:
+        print("No addresses found")
+    return active_addresses
+
+#Controls a discrete function to automatically water
+#For the author’s setup, this utilises the secondary purpose of the hydrofogger
+#Very simple to vary the actuator output to control either a water pump misting system or other
+def water(w_time, cont_c, sensors): #watering time
+    actuators = [0, 1, 1]
+    code = 11
+    file_writer(sensors, actuators, code)
+    print ('watering')
+    water_timer_cold = 0
+    water_timer_warm = 0
+    #turn hydrofogger on for w_time mins
+    #turn circulation fans on for w_time mins
+    GPIO.setup(cont_c[1], GPIO.OUT)
+    GPIO.setup(cont_c[2], GPIO.OUT)
+    GPIO.setup(cont_c[0], GPIO.OUT)
+    GPIO.output(cont_c[0], GPIO.HIGH)
+    GPIO.output(cont_c[1], GPIO.LOW)
+    GPIO.output(cont_c[2], GPIO.LOW)
+        #for each item turn to low state (on)
+    time.sleep (w_time/2) #*60 to change to seconds
+    file_writer(sensors, actuators, code)
+    time.sleep (w_time/2)
+    GPIO.output(cont_c[1], GPIO.HIGH)
+    GPIO.output(cont_c[2], GPIO.HIGH)
+        #for each item turn low state
+    #turn hydrofogger off
+    #return timer states (so that program that calls it knows its finished)
+    return water_timer_cold, water_timer_warm
+
+#Isolates the air circulation fans for independent control, not necessary for the author’s setup
+def circulate(c_time, circulate, sensors):
+    actuators = [0, 0, 1]
+    code = 10
+    file_writer(sensors, actuators, code)
+    print('circulate')
+    #turn all fans on for c_time mins
+    for item in circulate:
+        GPIO.setup(item, GPIO.OUT)
+        GPIO.output(item, GPIO.LOW)
+    time.sleep (c_time)
+    for item in circulate:
+        GPIO.output(item, GPIO.HIGH) #turns all fans off after c_time
+    return
+
+#Defines the procedure when temperature is permanently above the upper bound 
+def overheat(inlet, hydro, heater, sensors): #externally defined numbers
+    actuators = [0, 1, 1]
+    code = 9
+    file_writer(sensors, actuators, code)
+    print('overheating')
+#send notification of overheating
+    GPIO.setup(inlet, GPIO.OUT)
+    GPIO.setup(hydro, GPIO.OUT)
+    GPIO.setup(heater, GPIO.OUT)
+    GPIO.output(inlet, GPIO.LOW)
+    GPIO.output(heater, GPIO.HIGH)
+    GPIO.output(hydro, GPIO.LOW)   #hydrofogger on 
+    time.sleep (240)
+    GPIO.output(hydro, GPIO.HIGH)    #hydrofogger off
+    GPIO.output(inlet, GPIO.HIGH)
+    time.sleep (60)
+    return True
+
+#inverse of the upper bound, again could be integrated into the main climate controller, but by separating out these functions future additions specific to these cases can be more easily integrated
+def frozen(on, f_components, sensors, hydro):   #on and off are specific to outlet pipe
+    print('frozen')
+    actuators = [1, 0, 1]
+    code = 8
+    file_writer(sensors, actuators, code)
+    #send message of intense cold
+    #send message to remove inlet pipe and add insulation
+    #my inlet fan is disconnected from inlet pipe when cold so this acts as circulation fan
+    GPIO.setup(hydro, GPIO.OUT)
+    GPIO.output(hydro, GPIO.HIGH)
+    for item in f_components:
+        GPIO.setup(item, GPIO.OUT)
+        GPIO.output(item, GPIO.LOW)
+    time.sleep(on/2)
+    #file_writer(sensors, actuators, code)
+    time.sleep(on/2)
+    for item in f_components:
+        GPIO.output(item, GPIO.HIGH)
+    #reduce humidity during nighttime, limit to one watering cycle
+    #during daytime limit to 2 watering cycles at midday and afternoon
+    #fan heater on constantly
+
+#Determines which seasonal procedures to use, user defined bounds so applicable to any latitude
+def season_check(cold_end, cold_start):   #cold_end defined by user
+    month = datetime.now().month * 100
+    day = datetime.now().day
+    combo = month + day  #combining month and day
+    if ((combo >= cold_start) or (combo <= cold_end)):
+        cold = True
+        #when cold switches from false to true print something
+    else:
+        cold = False
+        #and vis versa
+    return cold
+
+#moving set point equation
+def get_theoretical_humidity(t_cont):
+    theo_hum = 92.37 - 0.543*exp(0.1141*t_cont)
+    return theo_hum
+
+#function for specific input variance
+def experimental_control(cont_c, sensors, INTEGRATIONTIME_200MS, GAIN_LOW, INTEGRATIONTIME_100MS, GAIN_HIGH, dht20, tsl):
+    for item in cont_c:
+        GPIO.setup(item, GPIO.OUT)
+    actuators = [0, 0, 0]
+    code = 51
+    #file_writer(sensors, actuators, code)  
+    #GPIO.output(cont_c[0], GPIO.HIGH)    #heater
+    #GPIO.output(cont_c[2], GPIO.HIGH)    #inlet
+    #GPIO.output(cont_c[1], GPIO.HIGH)   #hydrofogger
+    #time.sleep(300)
+    GPIO.output(cont_c[0], GPIO.LOW)    #heater
+    GPIO.output(cont_c[2], GPIO.HIGH)    #inlet
+    GPIO.output(cont_c[1], GPIO.HIGH)   #hydrofogger
+    sensors = []
+    i = 0
+    j = 0
+    k = 0
+    l = 0
+    while i <= 29:
+        actuators = [1, 0, 0]
+        code = 51
+        full, ir, lux, full_h, ir_h, lux_h, dht_temp, dht_hum = sensor_check(INTEGRATIONTIME_200MS, GAIN_LOW, INTEGRATIONTIME_100MS, GAIN_HIGH, dht20, tsl)
+        sensors = sensor_list(full, ir, lux, full_h, ir_h, lux_h, dht_temp, dht_hum, sensors)
+        file_writer(sensors, actuators, code)
+        sensors = []
+        time.sleep(30)
+        i += 1
+    GPIO.output(cont_c[0], GPIO.HIGH)    #heater
+    while j <= 29:
+        actuators = [0, 0, 0]
+        code = 51
+        full, ir, lux, full_h, ir_h, lux_h, dht_temp, dht_hum = sensor_check(INTEGRATIONTIME_200MS, GAIN_LOW, INTEGRATIONTIME_100MS, GAIN_HIGH, dht20, tsl)
+        sensors = sensor_list(full, ir, lux, full_h, ir_h, lux_h, dht_temp, dht_hum, sensors)
+        file_writer(sensors, actuators, code)
+        sensors = []
+        time.sleep(30)
+        j += 1
+    GPIO.output(cont_c[2], GPIO.LOW)    #inlet
+    GPIO.output(cont_c[1], GPIO.LOW)   #hydrofogger
+    GPIO.output(cont_c[0], GPIO.LOW)   #heater
+    '''
+    while k <= 19:
+        actuators = [1, 1, 1]
+        code = 51
+        full, ir, lux, full_h, ir_h, lux_h, dht_temp, dht_hum = sensor_check(INTEGRATIONTIME_200MS, GAIN_LOW, INTEGRATIONTIME_100MS, GAIN_HIGH, dht20, tsl)
+        sensors = sensor_list(full, ir, lux, full_h, ir_h, lux_h, dht_temp, dht_hum, sensors)
+        file_writer(sensors, actuators, code)
+        sensors = []
+        time.sleep(30)
+        k += 1
+    GPIO.output(cont_c[2], GPIO.HIGH)    #inlet
+    GPIO.output(cont_c[1], GPIO.HIGH)   #hydrofogger
+    while l <= 19:
+        actuators = [1, 0, 0]
+        code = 51
+        full, ir, lux, full_h, ir_h, lux_h, dht_temp, dht_hum = sensor_check(INTEGRATIONTIME_200MS, GAIN_LOW, INTEGRATIONTIME_100MS, GAIN_HIGH, dht20, tsl)
+        sensors = sensor_list(full, ir, lux, full_h, ir_h, lux_h, dht_temp, dht_hum, sensors)
+        file_writer(sensors, actuators, code)
+        sensors = []
+        time.sleep(30)
+        l += 1
+'''
+#PIP function initialisation
+def PIP(pip_set_u, pip_set_l, val, Ki, Fk, Gc, t_cont, night):
+    if night == False:
+        system_input = val[0] + Ki*(pip_set_u - t_cont) - Fk[0]*t_cont + Fk[0]*val[1] - Fk[1]*val[1]+ Fk[1]*val[2]
+        #system_input = pip_set_u - t_cont + Ki/(1-val[0]) - (Fk[0] + Fk[1]*val[0] + 1/(1+Gc*val[0]))
+    else:
+        system_input = val[0] + Ki*(pip_set_l - t_cont) - Fk[0]*t_cont + Fk[0]*val[1] - Fk[1]*val[1]+ Fk[1]*val[2]
+        #system_input = pip_set_l - t_cont + Ki/(1-val[0]) - (Fk[0] + Fk[1]*val[0] + 1/(1+Gc*val[0]))
+    print(system_input)
+    return system_input
+
+#Converts the PIP outuput to a PWM signal for the heater
+def PIP_convert(system_input, t):
+    #system_input_in = min(system_input, 1)
+    system_input_in = min(system_input, 0.999)
+    xPIP = max(t*system_input_in, 0.01) #0.999 and 0.01 are used in place of 1 and 0 to prevent false math operations
+    yPIP = (t-xPIP)/2
+    print(xPIP)
+    print(yPIP)
+    return xPIP, yPIP
+
+#Implements the PIP algorithm into the control
+def PIP_control(system_input, xPIP, yPIP, cont_c, INTEGRATIONTIME_200MS, GAIN_LOW, INTEGRATIONTIME_100MS, GAIN_HIGH, dht20, tsl):
+    print('using pip control')
+    sensors = []
+    for item in cont_c:
+        GPIO.setup(item, GPIO.OUT)
+    GPIO.output(cont_c[1], GPIO.HIGH)
+    GPIO.output(cont_c[2], GPIO.HIGH)
+    GPIO.output(cont_c[0], GPIO.HIGH)
+    actuators = [0, 0, 0]
+    code = [67, round(system_input, 4), round(xPIP, 4), round(yPIP, 4)]
+    full, ir, lux, full_h, ir_h, lux_h, dht_temp, dht_hum = sensor_check(INTEGRATIONTIME_200MS, GAIN_LOW, INTEGRATIONTIME_100MS, GAIN_HIGH, dht20, tsl)
+    sensors = sensor_list(full, ir, lux, full_h, ir_h, lux_h, dht_temp, dht_hum, sensors)
+    file_writer(sensors, actuators, code)
+    sensors = []
+    try:
+        time.sleep(yPIP)
+
+        actuators = [1, 0, 0]
+        full, ir, lux, full_h, ir_h, lux_h, dht_temp, dht_hum = sensor_check(INTEGRATIONTIME_200MS, GAIN_LOW, INTEGRATIONTIME_100MS, GAIN_HIGH, dht20, tsl)
+        sensors = sensor_list(full, ir, lux, full_h, ir_h, lux_h, dht_temp, dht_hum, sensors)
+        file_writer(sensors, actuators, code)
+        sensors = []
+        GPIO.output(cont_c[0], GPIO.LOW)
+
+        time.sleep(xPIP)
+
+        actuators = [0, 0, 0]
+        full, ir, lux, full_h, ir_h, lux_h, dht_temp, dht_hum = sensor_check(INTEGRATIONTIME_200MS, GAIN_LOW, INTEGRATIONTIME_100MS, GAIN_HIGH, dht20, tsl)
+        sensors = sensor_list(full, ir, lux, full_h, ir_h, lux_h, dht_temp, dht_hum, sensors)
+        file_writer(sensors, actuators, code)
+        sensors = []
+        GPIO.output(cont_c[0], GPIO.HIGH)
+
+        time.sleep(yPIP)
+    except:
+        print('PIP_control failed')
+#def file_name():
+    #file_name = "data" + datetime.now().strftime('%Y_%m_%d') + ".csv"
+    #return file_name
+#n_f is the number of time delays in the PIP controller
+
+#retrieves data from previously generated files
+def file_reader(n_f):
+    rows = []
+    file_name = "data" + str(date.today()) + ".csv"
+    with open(file_name, 'r', newline='') as working_file:
+        reader = csv.reader(working_file)
+        rows = list(reader)
+    if len(rows) < n_f:	#if the number of past data samples is less than what is needed, then the previous file is opened and the necessary data retrieved
+        x = len(rows)
+        last_rows = rows[-x:]
+        date_yesterday = date.today() - timedelta(days=1)
+        file_name = "data" + str(date_yesterday) + ".csv"
+        with open(file_name, 'r', newline='') as working_file:
+            reader = csv.reader(working_file)
+            rows = list(reader)
+        y = n_f - x
+        last_rows.extend(rows[-y:])
+        return last_rows
+    else:
+        last_rows = rows[-n_f:]
+        return last_rows
+
+#decides which type of data is needed for the algorithm (file_reader stores the entire rows in sublists, to retrieve just temperature, the data_switch is selected appropriately to do this)
+def data_select(data_switch, last_rows):
+    val = [float(sublist[data_switch]) for sublist in last_rows]
+    print (val)
+    return val
+
+#original controller, designed for intuitive monitoring but not optimised 
+def climate_control(h_cont, t_cont, tbound_l, tbound_u, cont_c, sensors, night, t):
+    for item in cont_c:
+        GPIO.setup(item, GPIO.OUT)
+    theo_hum = get_theoretical_humidity(t_cont)
+    try:
+        if night == False:
+            print('climate control, daytime')
+            if t_cont > tbound_l and t_cont < tbound_u:
+                if h_cont > theo_hum:
+                    actuators = [1, 0, 1]
+                    code = 2
+                    GPIO.output(cont_c[0], GPIO.LOW)    #heater
+                    GPIO.output(cont_c[2], GPIO.LOW)    #inlet
+                    GPIO.output(cont_c[1], GPIO.HIGH)   #hydrofogger
+                    file_writer(sensors, actuators, code)
+                    time.sleep(t)
+                else:
+                    actuators = [1, 1, 1]
+                    code = 1
+                    for item in cont_c:
+                        GPIO.output(item, GPIO.LOW)
+                    file_writer(sensors, actuators, code)
+                    time.sleep(t)
+        else:
+            print('climate control, nighttime')
+            if 14 < t_cont:   #maintains nighttime parameters to >14 celcius and 82.5% humidity or higher
+                if 82.5 > h_cont:
+                    actuators = [0, 1, 1]
+                    code = [6.1]
+                    GPIO.output(cont_c[2], GPIO.LOW) 
+                    GPIO.output(cont_c[0], GPIO.HIGH)
+                    GPIO.output(cont_c[1], GPIO.LOW)
+                    file_writer(sensors, actuators, code)
+                    time.sleep(3*(t/4))
+                    #actuators = [1, 0, 1]
+                    GPIO.output(cont_c[0], GPIO.LOW)
+                    #file_writer(sensors, actuators, code)
+                    time.sleep(t/4)
+                else:
+                    actuators = [0, 0, 1]
+                    code = [6.2]
+                    GPIO.output(cont_c[2], GPIO.LOW) 
+                    GPIO.output(cont_c[0], GPIO.HIGH)
+                    GPIO.output(cont_c[1], GPIO.HIGH)
+                    file_writer(sensors, actuators, code)
+                    time.sleep((t*3)/4)
+                    #actuators = [1, 0, 1]
+                    GPIO.output(cont_c[0], GPIO.LOW)
+                    #file_writer(sensors, actuators, code)
+                    time.sleep(t/4)
+            else:
+                actuators = [1, 0, 1]
+                code = 7
+                GPIO.output(cont_c[2], GPIO.LOW)
+                GPIO.output(cont_c[0], GPIO.LOW)
+                GPIO.output(cont_c[1], GPIO.HIGH)
+                file_writer(sensors, actuators, code)
+                time.sleep(t)
+                GPIO.output(cont_c[1], GPIO.LOW)
+                actuators = [1, 1, 1]
+                #file_writer(sensors, actuators, code)
+                time.sleep(12)
+    except:
+        print('sensor failure')
+        actuators = [9, 9, 9]
+        code = 911
+        file_writer(sensors, actuators, code)
+        broken(sensors, cont_c[0])
+
+#writes the data to a csv file, new file generated daily
+def file_writer(sensors, actuators, code):
+    data = []
+    #set up for loop for writing sensor and actuator data
+    data.append(datetime.now().strftime('%H:%M:%S'))
+    data.extend(sensors)
+    data.extend(actuators)
+    data.extend(str(code))   #changed from append
+    file_name = "data" + str(date.today()) + ".csv"
+    #file_name = "data" + datetime.now().strftime('%Y_%m_%d') + ".csv"
+    try:
+        file=open(file_name,"a")
+        print('File exists')
+        file.close()
+    except:
+        file = open(file_name, "a")
+        file.close()    
+    with open(file_name, "a") as file:
+        writer = csv.writer(file)
+        writer.writerow(data)
+
+#initialisation of light sensor (uses pre-made library)
+def test(int_time, gain, tsl):
+        tsl.set_gain(gain)
+        tsl.set_timing(int_time)
+        full_test, ir_test = tsl.get_full_luminosity()
+        lux_test = tsl.calculate_lux(full_test, ir_test)
+        return full_test, ir_test, lux_test
+
+#primary redundancy program, if any controlling code fails, this ensures the heater continues to run on a reasonable setting
+def broken(sensors, heater):
+    actuators = [1, 0, 0]
+    code = 999
+    print('broken')
+    file_writer(sensors, actuators, code)
+    GPIO.setup(heater, GPIO.OUT)
+    GPIO.setup(6, GPIO.OUT)
+    GPIO.output(heater, GPIO.LOW)
+    time.sleep(120)
+    GPIO.output(heater, GPIO.HIGH)
+    GPIO.output(6, GPIO.LOW)
+    actuators = [0, 0, 0]
+    file_writer(sensors, actuators, code)
+    time.sleep(30)
+
+#uses initialised sensors and stores their readings as floats
+def sensor_check(INTEGRATIONTIME_200MS, GAIN_LOW, INTEGRATIONTIME_100MS, GAIN_HIGH, dht20, tsl):
+    try:
+        full, ir, lux = test(INTEGRATIONTIME_200MS, GAIN_LOW, tsl)
+    except:
+        lux = full = ir = 99999
+        print('tsl integration broken, reverting to seasonal operation')
+    try:
+        full_h, ir_h, lux_h = test(INTEGRATIONTIME_100MS, GAIN_HIGH, tsl)
+    except:
+        full_h = ir_h = lux_h = 99999
+        print('tsl gain broken, reverting to seasonal operation')
+    try:
+        dht_temp, dht_hum, crc = dht20.get_temperature_and_humidity()
+    except:
+        dht_temp = dht_hum = 999
+    return full, ir, lux, full_h, ir_h, lux_h, dht_temp, dht_hum
+
+#stores all sensor data in the list ‘sensors’
+def sensor_list(full, ir, lux, full_h, ir_h, lux_h, dht_temp, dht_hum, sensors):
+    sensors.append(round(dht_temp, 3))
+    sensors.append(round(dht_hum, 3))
+    sensors.append(full)
+    sensors.append(ir)
+    sensors.append(round(lux, 3))
+    sensors.append(full_h)
+    sensors.append(ir_h)
+    sensors.append(round(lux_h, 3))
+    return sensors
+
+#where multiple thermocouples/humidity sensors are present, an algorithm can be used to either decide a specific controlling sensor or the algorithm could be altered to use a mean of all readings
+def sensor_decide(sensors, heater):
+    h_break = False
+    t_break = False
+    if sensors[0] <= 50 and sensors[0] >= 1:
+        t_cont = sensors[0]     #this is where redundancy can be set up (if x sensor = 99999 assign t_cont to other sensor and cycle till we have working sensor)
+        print('using dht for temp')
+    else:
+        t_break = True
+        #t_cont = 0
+        broken(sensors, heater)
+    if sensors[1] >= 10 or sensors[1] <= 100:
+        h_cont = sensors[1]
+        print('using dht for humidity')
+    else:
+        h_break = True
+       #h_cont = 0
+        print('dht broken')
+        broken(sensors, heater)
+    return t_cont, h_cont, h_break, t_break
+
+#uses lux data to determine day/night, the bound of 2.7 accounts for medium-heavy cloud during daytime
+def time_of_day(sensors):
+    if sensors[4] < 2.7:
+        night = True
+        print('nighttime')
+    else:
+        night = False
+        print('daytime')
+    return night
