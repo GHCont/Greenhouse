@@ -1,0 +1,95 @@
+import os
+import RPi.GPIO as GPIO
+import time
+from DFRobot_DHT20 import DFRobot_DHT20
+from tcl_lib import Tsl2591
+import time
+from presets import *
+from control_methods import *
+
+#actuators numbering: [heater, hydrofogger, inlet/circulation fan]
+GPIO.setmode(GPIO.BCM) #sets GPIO pins to BCM (Broadcom) numbering
+GPIO.setwarnings(False)
+
+#initialising i2c libraries
+dht20 = DFRobot_DHT20(I2C_BUS ,I2C_ADDRESS)
+tsl = Tsl2591()
+
+while main == True:
+    try:
+        os.system('clear')	#clears all data from terminal
+        #rows_output = file_reader(n)    #stores last n rows to a list with each row as a sublist
+        #past_data_therm = data_select(1, rows_output)   #stores last n therm datapoints in a list
+        #past_data_rh = data_select(2, rows_output)  #stores last n rh datapoints in a list
+        addr = i2c_return()
+        if len(addr) > 4:	#if this case is true, the number of i2c addresses detected is less than should exist, thus the a fault with the i2c bus has occured
+            reset_i2c_bus()
+            broken(str(0), heater)
+        else: 
+            code = 0
+            actuators = []
+            sensors = []    #no need for try except at initialisation, already done in function def (99999 if CRC!=YES)
+            full, ir, lux, full_h, ir_h, lux_h, dht_temp, dht_hum = sensor_check(INTEGRATIONTIME_200MS, GAIN_LOW, INTEGRATIONTIME_100MS, GAIN_HIGH, dht20, tsl)
+            time.sleep(0.1)
+            sensors = sensor_list(full, ir, lux, full_h, ir_h, lux_h, dht_temp, dht_hum, sensors)
+            time.sleep(0.1)
+            t_cont, h_cont, h_break, t_break = sensor_decide(sensors, heater)
+            time.sleep(0.1)
+            print("in loop")
+            night = time_of_day(sensors)	#sets night Boolean using time of day function
+            cold = season_check(cold_end, cold_start)   #for the sake of testing
+            if t_cont <= 14 or t_cont >= 28:  #naming of sensors to be configured depending on location, can have sensor redundancy in place i.e. if one sensor goes offline, utilise other sensors and make approximation
+                if t_cont <= 14:   #redundancy if temperature outside of safe range
+                    frozen(frozen_length, f_components, sensors, hydro)  
+                elif t_cont >= 28 and t_cont <= 50:	#if it is outside this range, then the sensors are likely broken
+                    overheat(inlet, hydro, heater, sensors)   
+                else: #t_cont broken, try other sensor
+                    broken(sensors, heater)
+            else:
+                if cold == True:  #winter here is defined as Autumn to late Spring
+                    if water_timer_cold >= 45:    #counter is essentially in minutes*2 as the time.sleep(t) is bi-minute
+                        water_timer_cold, water_timer_warm = water(w_time, cont_c, sensors)
+                        #time.sleep(t)
+                    else:
+                        if control_select == 0: 	#switches between the 3 methods of control using a preset value
+                            climate_control(h_cont, t_cont, tbound_l, tbound_u, cont_c, sensors, night, t)   #environment control algorithm
+                            water_timer_cold += 1
+                        elif control_select == 1:
+                            experimental_control(cont_c, sensors, INTEGRATIONTIME_200MS, GAIN_LOW, INTEGRATIONTIME_100MS, GAIN_HIGH, dht20, tsl)
+                        elif control_select == 2:
+                            last_rows = file_reader(n_f)
+                            val = data_select(data_switch, last_rows)
+                            system_input = PIP(pip_set_u, pip_set_l, val, Ki, Fk, Gc, t_cont, night)
+                            xPIP, yPIP = PIP_convert(system_input, t)
+                            PIP_control(system_input, xPIP, yPIP, cont_c, INTEGRATIONTIME_200MS, GAIN_LOW, INTEGRATIONTIME_100MS, GAIN_HIGH, dht20, tsl)
+                        else:
+                            print('control select not in reasonable bounds, reverting to climate control')
+                            climate_control(h_cont, t_cont, tbound_l, tbound_u, cont_c, sensors, night, t)   #environment control algorithm
+                            water_timer_cold += 1
+                elif cold == False:    #summer is defined as the rest of the time of year not included in the winter category
+                    if water_timer_warm >=80 and night == True:  #watering will occur more in summer with the higher inherent temperatures in the greenhouse
+                        water_timer_cold, water_timer_warm = water(w_time, cont_c, sensors)
+                        #time.sleep(t)
+                    else:
+                        if control_select == 0: 
+                            climate_control(h_cont, t_cont, tbound_l, tbound_u, cont_c, sensors, night, t)   #environment control algorithm
+                            water_timer_warm += 1
+                        elif control_select == 1:
+                            experimental_control(cont_c, sensors, INTEGRATIONTIME_200MS, GAIN_LOW, INTEGRATIONTIME_100MS, GAIN_HIGH, dht20, tsl)
+                        elif control_select == 2:
+                            last_rows = file_reader(n_f)
+                            system_input = PIP(pip_set_u, pip_set_l, val, Ki, Fk, Gc, t_cont, night)
+                            xPIP, yPIP = PIP_convert(system_input, t)
+                            PIP_control(system_input, xPIP, yPIP, cont_c, INTEGRATIONTIME_200MS, GAIN_LOW, INTEGRATIONTIME_100MS, GAIN_HIGH, dht20, tsl)
+                        else:
+                            print('control select not in reasonable bounds, reverting to climate control')
+                            climate_control(h_cont, t_cont, tbound_l, tbound_u, cont_c, sensors, night, t)   #environment control algorithm
+                            water_timer_warm += 1
+                else: 
+                    print("Error in season declaration")
+    except:
+        i2c_return()
+        broken(str(0), heater)
+
+GPIO.cleanup()  #returns all pins to factory settings i.e. in LOW position
+os.system('clear')  #clears python terminal
